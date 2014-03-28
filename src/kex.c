@@ -276,86 +276,123 @@ char *ssh_find_matching(const char *available_d, const char *preferred_d){
 }
 
 SSH_PACKET_CALLBACK(ssh_packet_kexinit){
-	int server_kex=session->server;
-  ssh_string str = NULL;
-  char *strings[KEX_METHODS_SIZE];
-  int i;
+    int i;
+    int server_kex=session->server;
+    ssh_string str = NULL;
+    char *strings[KEX_METHODS_SIZE];
+    int rc = SSH_ERROR;
 
-  (void)type;
-  (void)user;
-  memset(strings, 0, sizeof(strings));
-  if (session->session_state == SSH_SESSION_STATE_AUTHENTICATED){
-      SSH_LOG(SSH_LOG_WARNING, "Other side initiating key re-exchange");
-  } else if(session->session_state != SSH_SESSION_STATE_INITIAL_KEX){
-  	ssh_set_error(session,SSH_FATAL,"SSH_KEXINIT received in wrong state");
-  	goto error;
-  }
-  if (server_kex) {
-      if (buffer_get_data(packet,session->next_crypto->client_kex.cookie,16) != 16) {
-        ssh_set_error(session, SSH_FATAL, "ssh_packet_kexinit: no cookie in packet");
+    uint8_t first_kex_packet_follows = 0;
+    uint32_t kexinit_reserved = 0;
+
+    (void)type;
+    (void)user;
+
+    memset(strings, 0, sizeof(strings));
+    if (session->session_state == SSH_SESSION_STATE_AUTHENTICATED){
+        SSH_LOG(SSH_LOG_WARNING, "Other side initiating key re-exchange");
+    } else if(session->session_state != SSH_SESSION_STATE_INITIAL_KEX){
+        ssh_set_error(session,SSH_FATAL,"SSH_KEXINIT received in wrong state");
         goto error;
-      }
+    }
 
-      if (hashbufin_add_cookie(session, session->next_crypto->client_kex.cookie) < 0) {
-        ssh_set_error(session, SSH_FATAL, "ssh_packet_kexinit: adding cookie failed");
+    if (server_kex) {
+        rc = buffer_get_data(packet,session->next_crypto->client_kex.cookie, 16);
+        if (rc != 16) {
+            ssh_set_error(session, SSH_FATAL, "ssh_packet_kexinit: no cookie in packet");
+            goto error;
+        }
+
+        rc = hashbufin_add_cookie(session, session->next_crypto->client_kex.cookie);
+        if (rc < 0) {
+            ssh_set_error(session, SSH_FATAL, "ssh_packet_kexinit: adding cookie failed");
+            goto error;
+        }
+    } else {
+        rc = buffer_get_data(packet,session->next_crypto->server_kex.cookie, 16);
+        if (rc != 16) {
+            ssh_set_error(session, SSH_FATAL, "ssh_packet_kexinit: no cookie in packet");
+            goto error;
+        }
+
+        rc = hashbufin_add_cookie(session, session->next_crypto->server_kex.cookie);
+        if (rc < 0) {
+            ssh_set_error(session, SSH_FATAL, "ssh_packet_kexinit: adding cookie failed");
+            goto error;
+        }
+    }
+
+    for (i = 0; i < KEX_METHODS_SIZE; i++) {
+        str = buffer_get_ssh_string(packet);
+        if (str == NULL) {
+          break;
+        }
+
+        rc = buffer_add_ssh_string(session->in_hashbuf, str);
+        if (rc < 0) {
+            ssh_set_error(session, SSH_FATAL, "Error adding string in hash buffer");
+            goto error;
+        }
+
+        strings[i] = ssh_string_to_char(str);
+        if (strings[i] == NULL) {
+            ssh_set_error_oom(session);
+            goto error;
+        }
+        ssh_string_free(str);
+        str = NULL;
+    }
+
+    /* copy the server kex info into an array of strings */
+    if (server_kex) {
+        for (i = 0; i < SSH_KEX_METHODS; i++) {
+            session->next_crypto->client_kex.methods[i] = strings[i];
+        }
+    } else { /* client */
+        for (i = 0; i < SSH_KEX_METHODS; i++) {
+            session->next_crypto->server_kex.methods[i] = strings[i];
+        }
+    }
+
+    /*
+     * Handle the two final fields for the KEXINIT message (RFC 4253 7.1):
+     *
+     *      boolean      first_kex_packet_follows
+     *      uint32       0 (reserved for future extension)
+     *
+     * Notably if clients set 'first_kex_packet_follows', it is expected
+     * that its value is included when computing the session ID (see
+     * 'make_sessionid').
+     */
+    rc = buffer_get_u8(packet, &first_kex_packet_follows);
+    if (rc != 1) {
         goto error;
-      }
-  } else {
-      if (buffer_get_data(packet,session->next_crypto->server_kex.cookie,16) != 16) {
-        ssh_set_error(session, SSH_FATAL, "ssh_packet_kexinit: no cookie in packet");
+    }
+
+    rc = buffer_add_u8(session->in_hashbuf, first_kex_packet_follows);
+    if (rc < 0) {
         goto error;
-      }
+    }
 
-      if (hashbufin_add_cookie(session, session->next_crypto->server_kex.cookie) < 0) {
-        ssh_set_error(session, SSH_FATAL, "ssh_packet_kexinit: adding cookie failed");
+    rc = buffer_add_u32(session->in_hashbuf, kexinit_reserved);
+    if (rc < 0) {
         goto error;
-      }
-  }
-
-  for (i = 0; i < KEX_METHODS_SIZE; i++) {
-    str = buffer_get_ssh_string(packet);
-    if (str == NULL) {
-      break;
     }
 
-    if (buffer_add_ssh_string(session->in_hashbuf, str) < 0) {
-    	ssh_set_error(session, SSH_FATAL, "Error adding string in hash buffer");
-      goto error;
-    }
+    session->session_state = SSH_SESSION_STATE_KEXINIT_RECEIVED;
+    session->dh_handshake_state = DH_STATE_INIT;
+    session->ssh_connection_callback(session);
+    return SSH_PACKET_USED;
 
-    strings[i] = ssh_string_to_char(str);
-    if (strings[i] == NULL) {
-    	ssh_set_error_oom(session);
-      goto error;
-    }
-    ssh_string_free(str);
-    str = NULL;
-  }
-
-  /* copy the server kex info into an array of strings */
-  if (server_kex) {
-    for (i = 0; i < SSH_KEX_METHODS; i++) {
-      session->next_crypto->client_kex.methods[i] = strings[i];
-    }
-  } else { /* client */
-    for (i = 0; i < SSH_KEX_METHODS; i++) {
-      session->next_crypto->server_kex.methods[i] = strings[i];
-    }
-  }
-
-  session->session_state=SSH_SESSION_STATE_KEXINIT_RECEIVED;
-  session->dh_handshake_state=DH_STATE_INIT;
-  session->ssh_connection_callback(session);
-  return SSH_PACKET_USED;
 error:
-  ssh_string_free(str);
-  for (i = 0; i < SSH_KEX_METHODS; i++) {
-    SAFE_FREE(strings[i]);
-  }
+    ssh_string_free(str);
+    for (i = 0; i < SSH_KEX_METHODS; i++) {
+        SAFE_FREE(strings[i]);
+    }
 
-  session->session_state = SSH_SESSION_STATE_ERROR;
+    session->session_state = SSH_SESSION_STATE_ERROR;
 
-  return SSH_PACKET_USED;
+    return SSH_PACKET_USED;
 }
 
 void ssh_list_kex(struct ssh_kex_struct *kex) {
